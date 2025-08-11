@@ -20,6 +20,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health check endpoint for Railway
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'Miso70 Backend is running!',
+    timestamp: new Date().toISOString()
+  });
+});
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
