@@ -771,7 +771,7 @@ app.post('/generate-image', async (req, res) => {
     const { dish } = req.body;
     
     // Enhanced prompt for Albedo model - optimized for illustration style
-    const prompt = `A beautiful hand-drawn illustration of a single food dish, specifically ${dish}, in Japanese retro style, flat colors, grainy texture, minimalist design, no text or writing or caption on image, no watermark, not a photo, Subtle lighting with soft shadows. Detailed linework and ornate patterns evoke a timeless, nostalgic atmosphere. The composition should feel intimate, inviting, and slightly cinematic, like a hand-drawn or painted scene with refined details.`;
+    const prompt = `A beautiful hand-drawn illustration of ${dish}, Japanese retro style, flat colors, grainy texture, minimalist design, no text or writing or caption on image, no watermark, not a photo, clean illustration style, warm colors, food illustration`;
     
     console.log('Making ModelLab API call with Albedo model...');
     console.log('Using API URL:', MODELLAB_API_URL);
