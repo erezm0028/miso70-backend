@@ -824,19 +824,121 @@ CRITICAL:
         }
       }
 
-      // Skip image generation during modification - let frontend handle it on dish load
-      console.log('Skipping image generation during modification - will generate when user loads dish');
+      // Generate new image for the transformed dish
+      let newImageUrl = null;
+      try {
+        console.log('Generating new image for transformed dish:', recipeObj.title);
+        
+        const prompt = `A beautiful hand-drawn illustration of a single food dish, specifically ${dish}, in Japanese retro style, flat colors, grainy texture, minimalist design, no text or writing or caption on image, no watermark, not a photo, Subtle lighting with soft shadows. Detailed linework and ornate patterns evoke a timeless, nostalgic atmosphere. The composition should feel intimate, inviting, and slightly cinematic, like a hand-drawn or painted scene with refined details.`;
+        
+        // Try DALL-E first
+        try {
+          console.log('Attempting DALL-E for transformation image...');
+          const dalleResponse = await openai.images.generate({
+            model: "dall-e-3",
+            prompt: prompt,
+            n: 1,
+            size: "1024x1024",
+          });
+          
+          if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
+            newImageUrl = dalleResponse.data[0].url;
+            console.log('DALL-E transformation image generated:', newImageUrl.substring(0, 50) + '...');
+          } else {
+            throw new Error('Invalid DALL-E response structure');
+          }
+        } catch (dalleErr) {
+          console.log('DALL-E failed for transformation, trying ModelLab fallback...');
+          
+          // ModelLab fallback
+          const imageResponse = await axios.post(MODELLAB_API_URL, {
+            prompt: prompt,
+            model_id: "albedobase-xl-v0-2",
+            lora_model: null,
+            width: "512",
+            height: "512",
+            negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+            num_inference_steps: "20",
+            scheduler: "DPMSolverMultistepScheduler",
+            guidance_scale: "7.5",
+            enhance_prompt: null
+          }, {
+            headers: {
+              'key': MODELLAB_API_TOKEN,
+              'Content-Type': 'application/json'
+            },
+            // No timeout for initial request - let ModelLab take as long as needed
+            maxRedirects: 0,
+            validateStatus: (status) => status < 500
+          });
+        
+          // Check if we have a ready image URL regardless of status
+          if (imageResponse.data.output?.[0]) {
+            newImageUrl = imageResponse.data.output[0];
+            console.log('ModelLab transformation image generated:', newImageUrl.substring(0, 50) + '...');
+          } else if (imageResponse.data.status === 'processing') {
+            // Handle polling for processing status
+            const taskId = imageResponse.data.id;
+            const fetchUrl = imageResponse.data.fetch_result;
+            
+            if (!taskId || !fetchUrl) {
+              throw new Error('No task ID or fetch URL received for polling');
+            }
+            
+            let attempts = 0;
+            const maxAttempts = 120; // 30 seconds max (120 * 0.25s)
+            const eta = imageResponse.data.eta || 0.25;
+            
+            while (attempts < maxAttempts) {
+              const delay = Math.min(250, Math.max(100, eta * 1000)); // 100ms to 250ms based on ETA
+              await new Promise(resolve => setTimeout(resolve, delay));
+              
+              try {
+                const pollResponse = await axios.post(fetchUrl, {}, {
+                  headers: { 'key': MODELLAB_API_TOKEN },
+                  timeout: 2000, // Reduced from 3s to 2s
+                  maxRedirects: 0
+                });
+                
+                if (pollResponse.data.status === 'success' && pollResponse.data.output?.[0]) {
+                  newImageUrl = pollResponse.data.output[0];
+                  console.log('ModelLab transformation image generated (polled):', newImageUrl.substring(0, 50) + '...');
+                  break;
+                } else if (pollResponse.data.status === 'failed') {
+                  throw new Error(`ModelLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
+                } else if (pollResponse.data.status === 'error') {
+                  throw new Error(`ModelLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
+                }
+              } catch (pollErr) {
+                console.error('Polling error:', pollErr.message);
+                if (attempts === maxAttempts - 1) {
+                  throw pollErr;
+                }
+              }
+              attempts++;
+            }
+            
+            if (!newImageUrl) {
+              throw new Error('Image generation timed out after 30 seconds');
+            }
+          } else {
+            throw new Error(`ModelLab error: ${imageResponse.data.status}`);
+          }
+        }
+      } catch (imageErr) {
+        console.error('Failed to generate new image for transformation:', imageErr.message);
+        // Continue without new image - use original or placeholder
+      }
 
       res.json({ 
         recipe: recipeObj,
         isTransformative: true,
         transformationSummary: recipeObj.transformation_summary || `Transformed ${dishName} into ${recipeObj.title}`,
+        newImageUrl: newImageUrl, // Include the new image URL if generated
         updatedDish: {
           title: recipeObj.title,
           description: recipeObj.description,
-          summary: recipeObj.transformation_summary || `Transformed ${dishName} into ${recipeObj.title}`,
-          image: '', // No image - will be generated when user loads dish
-          recipe: recipeObj
+          summary: recipeObj.transformation_summary || `Transformed ${dishName} into ${recipeObj.title}`
         }
       });
       
@@ -858,7 +960,7 @@ This is a MINOR MODIFICATION to an existing dish, NOT a new dish creation. You M
 
 1. **PRESERVE THE DISH'S CORE IDENTITY**: Keep the same main ingredients, cooking method, and overall concept
 2. **MAKE ONLY THE REQUESTED CHANGE**: If they say "I don't have maple, add a sweetener instead", ONLY replace maple with another sweetener (honey, brown sugar, agave, etc.)
-3. **UPDATE DISH NAME IF NEEDED**: If the change significantly affects the dish's identity (like replacing pesto with tomato dressing), update the title to reflect the new dish. Otherwise, keep the same title
+3. **KEEP THE SAME DISH NAME**: Do NOT change the dish title
 4. **MAINTAIN THE SAME CUISINE STYLE**: Do NOT change the cultural origin or style
 5. **PRESERVE THE MAIN INGREDIENTS**: Keep the primary proteins, vegetables, and starches the same
 6. **MINIMAL ADJUSTMENTS**: Only modify what's absolutely necessary for the requested change
@@ -867,17 +969,16 @@ This is a MINOR MODIFICATION to an existing dish, NOT a new dish creation. You M
 9. **STYLE MODIFICATIONS**: For style changes like "spicy mexican style", add appropriate spices and seasonings while keeping the same main ingredients and cooking method
 
 SPECIFIC EXAMPLES:
-- "I don't have maple" → Replace maple with honey/brown sugar/agave, keep title and everything else identical
-- "Add a sweetener instead of maple" → Replace maple with another sweetener, keep title and dish structure identical  
-- "I don't have bacon" → Replace bacon with similar protein (pancetta, ham, etc.), keep title and dish concept identical
-- "Make it less spicy" → Reduce chili/spice amounts, keep title and all other ingredients identical
-- "Add cheese" → Add cheese to existing dish, keep title, do NOT turn it into a completely different dish
-- "Change to wrap" → Add tortilla/wrap and adjust serving method, keep same ingredients and measurements, keep title
-- "Change to comfort plate" → Adjust plating, keep same ingredients and measurements, keep title
-- "Replace pesto with tomato dressing" → Update title from "Pesto Chicken Salad" to "Tomato Chicken Salad" since pesto is the defining element
-- "Replace marinara with alfredo" → Update title from "Marinara Pasta" to "Alfredo Pasta" since sauce defines the dish
-- "Make it spicy mexican style" → Add Mexican spices, keep main ingredients, may update title to include "Mexican Style"
-- "Make it italian style" → Add Italian herbs, keep main ingredients, may update title to include "Italian Style"
+- "I don't have maple" → Replace maple with honey/brown sugar/agave, keep everything else identical
+- "Add a sweetener instead of maple" → Replace maple with another sweetener, keep dish structure identical
+- "I don't have bacon" → Replace bacon with similar protein (pancetta, ham, etc.), keep dish concept identical
+- "Make it less spicy" → Reduce chili/spice amounts, keep all other ingredients and method identical
+- "Add cheese" → Add cheese to existing dish, do NOT turn it into a completely different dish
+- "Change to wrap" → Add tortilla/wrap and adjust serving method, keep same ingredients and measurements
+- "Change to comfort plate" → Adjust plating, keep same ingredients and measurements
+- "Make it spicy mexican style" → Add Mexican spices (chili powder, cumin, paprika), jalapeños, lime, cilantro, keep same main ingredients and cooking method
+- "Make it italian style" → Add Italian herbs (basil, oregano, thyme), garlic, olive oil, keep same main ingredients and cooking method
+- "Make it spicy" → Add chili peppers, hot sauce, or spicy seasonings, keep same main ingredients and cooking method
 
 WHAT NOT TO DO:
 - "I don't have maple" → Do NOT create a completely different dish
@@ -889,17 +990,14 @@ WHAT NOT TO DO:
 The modified dish should be recognizable as the SAME dish with only the requested ingredient substitution or minor adjustment.
 
 Please provide the modified recipe in JSON format with these fields:
-- "title" (string - update if the change affects dish identity, otherwise keep original)
-- "description" (string - describe what the dish IS NOW, not what changed)
 - "ingredients" (array of strings with measurements)
 - "instructions" (array of steps)
 - "nutrition" (object with numeric values only, no units: calories, protein, carbs, fat, fiber, sugar, sodium)
 - "estimated_time" (string)
+- "description" (string)
 - "modification_summary" (string describing what changed)
 
 IMPORTANT: 
-- "title": If replacing a key ingredient (like pesto → tomato), update the title to reflect the new dish
-- "description": Describe the final dish, not the modification process. Say "A chicken salad with tomato dressing" not "A pesto salad modified with tomato dressing"
 - All nutrition values must be numbers without units (e.g., 30, not "30g")
 - All ingredients must include specific measurements (cups, tablespoons, pounds, ounces, etc.)
 - Preserve the original dish structure and cooking method
@@ -921,33 +1019,48 @@ IMPORTANT:
         });
       }
 
-      // Skip image generation during modification - let frontend handle it on dish load
-      console.log('Skipping image generation during modification - will generate when user loads dish');
+      // Generate new image for ALL modifications since they create new history entries
+      let newImageUrl = null;
+      const shouldGenerateNewImage = true; // Always generate new image for modifications
       
-      if (false) { // Disabled image generation
+      if (shouldGenerateNewImage) {
         try {
           // Use the new dish title if available, otherwise use the original dish name
           const dishTitleForImage = recipeObj.title || dishName;
           console.log('Generating new image for modified dish:', dishTitleForImage);
-          const imagePrompt = `A beautiful hand-drawn illustration of a single food dish, specifically ${dish}, in Japanese retro style, flat colors, grainy texture, minimalist design, no text or writing or caption on image, no watermark, not a photo, Subtle lighting with soft shadows. Detailed linework and ornate patterns evoke a timeless, nostalgic atmosphere. The composition should feel intimate, inviting, and slightly cinematic, like a hand-drawn or painted scene with refined details.`;
+          const imagePrompt = `A beautiful hand-drawn illustration of ${dishTitleForImage}, Japanese retro style, flat colors, grainy texture, minimalist design, no text, no watermark, not a photo`;
           
-          // Try ModelsLab first
+          // Try DALL-E first
           try {
-            console.log('Attempting ModelsLab for modification image...');
-            const modelsLabResponse = await axios.post(MODELLAB_API_URL, {
+            console.log('Attempting DALL-E for modification image...');
+            const dalleResponse = await openai.images.generate({
+              model: "dall-e-3",
               prompt: imagePrompt,
-              model_id: "boziorealvisxlv4",
-              lora_model: "hasui-kawase-style-sd-xl",
-              lora_strength: 1.2,
-              width: "1024",
-              height: "1024",
-              seed: Math.floor(Math.random() * 1000000),
-              negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), (morbid), (mutilated), (out of frame), (extra limbs), (bad anatomy), (disfigured), (deformed), (cross-eye), (glitch), (oversaturated), (overexposed), (underexposed), (bad proportions), (bad hands), (bad feet), (cloned face), (long neck), (missing arms), (missing legs), (extra fingers), (fused fingers), (poorly drawn hands), (poorly drawn face), (mutation), (deformed eyes), watermark, text, logo, signature, grainy, tiling, censored, nsfw, ugly, blurry eyes, noisy image, bad lighting, unnatural skin, asymmetry",
-              num_inference_steps: "35",
+              n: 1,
+              size: "1024x1024",
+            });
+            
+            if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
+              newImageUrl = dalleResponse.data[0].url;
+              console.log('DALL-E modification image generated:', newImageUrl.substring(0, 50) + '...');
+            } else {
+              throw new Error('Invalid DALL-E response structure');
+            }
+          } catch (dalleErr) {
+            console.log('DALL-E failed for modification, trying ModelLab fallback...');
+            
+            // ModelLab fallback
+            const imageResponse = await axios.post(MODELLAB_API_URL, {
+              prompt: imagePrompt,
+              model_id: "albedobase-xl-v0-2",
+              lora_model: null,
+              width: "512",
+              height: "512",
+              negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+              num_inference_steps: "20",
               scheduler: "DPMSolverMultistepScheduler",
-              guidance_scale: "8.0",
-              enhance_prompt: false,
-              key: MODELLAB_API_TOKEN
+              guidance_scale: "7.5",
+              enhance_prompt: null
             }, {
               headers: {
                 'key': MODELLAB_API_TOKEN,
@@ -958,29 +1071,14 @@ IMPORTANT:
               validateStatus: (status) => status < 500
             });
           
-            // Check if we have a ready image URL in multiple possible locations
-            let imageUrl = null;
-            
-            // Check primary output location
-            if (modelsLabResponse.data.output?.[0]) {
-              imageUrl = modelsLabResponse.data.output[0];
-            }
-            // Check meta.output location (where ModelsLab often puts the ready image)
-            else if (modelsLabResponse.data.meta?.output?.[0]) {
-              imageUrl = modelsLabResponse.data.meta.output[0];
-            }
-            // Check future_links location (alternative location)
-            else if (modelsLabResponse.data.future_links?.[0]) {
-              imageUrl = modelsLabResponse.data.future_links[0];
-            }
-            
-            if (imageUrl) {
-              newImageUrl = imageUrl;
-              console.log('ModelsLab modification image generated:', newImageUrl.substring(0, 50) + '...');
-            } else if (modelsLabResponse.data.status === 'processing') {
+            // Check if we have a ready image URL regardless of status
+            if (imageResponse.data.output?.[0]) {
+              newImageUrl = imageResponse.data.output[0];
+              console.log('ModelLab modification image generated:', newImageUrl.substring(0, 50) + '...');
+            } else if (imageResponse.data.status === 'processing') {
               // Handle polling for processing status
-              const taskId = modelsLabResponse.data.id;
-              const fetchUrl = modelsLabResponse.data.fetch_result;
+              const taskId = imageResponse.data.id;
+              const fetchUrl = imageResponse.data.fetch_result;
               
               if (!taskId || !fetchUrl) {
                 throw new Error('No task ID or fetch URL received for polling');
@@ -988,7 +1086,7 @@ IMPORTANT:
               
               let attempts = 0;
               const maxAttempts = 120; // 30 seconds max (120 * 0.25s)
-              const eta = modelsLabResponse.data.eta || 0.25;
+              const eta = imageResponse.data.eta || 0.25;
               
               while (attempts < maxAttempts) {
                 const delay = Math.min(250, Math.max(100, eta * 1000)); // 100ms to 250ms based on ETA
@@ -1003,12 +1101,12 @@ IMPORTANT:
                   
                   if (pollResponse.data.status === 'success' && pollResponse.data.output?.[0]) {
                     newImageUrl = pollResponse.data.output[0];
-                    console.log('ModelsLab modification image generated (polled):', newImageUrl.substring(0, 50) + '...');
+                    console.log('ModelLab modification image generated (polled):', newImageUrl.substring(0, 50) + '...');
                     break;
                   } else if (pollResponse.data.status === 'failed') {
-                    throw new Error(`ModelsLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
+                    throw new Error(`ModelLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
                   } else if (pollResponse.data.status === 'error') {
-                    throw new Error(`ModelsLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
+                    throw new Error(`ModelLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
                   }
                 } catch (pollErr) {
                   console.error('Polling error:', pollErr.message);
@@ -1023,29 +1121,7 @@ IMPORTANT:
                 throw new Error('Image generation timed out after 30 seconds');
               }
             } else {
-              throw new Error(`ModelsLab error: ${modelsLabResponse.data.status}`);
-            }
-          } catch (modelsLabErr) {
-            console.log('ModelsLab failed for modification, trying DALL-E fallback...');
-            
-            // DALL-E fallback
-            try {
-              const dalleResponse = await openai.images.generate({
-                model: "dall-e-3",
-                prompt: imagePrompt,
-                n: 1,
-                size: "1024x1024",
-              });
-              
-              if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
-                newImageUrl = dalleResponse.data[0].url;
-                console.log('DALL-E modification image generated (fallback):', newImageUrl.substring(0, 50) + '...');
-              } else {
-                throw new Error('Invalid DALL-E response structure');
-              }
-            } catch (dalleErr) {
-              console.error('Both ModelsLab and DALL-E failed for modification:', dalleErr.message);
-              throw dalleErr;
+              throw new Error(`ModelLab error: ${imageResponse.data.status}`);
             }
           }
         } catch (imageErr) {
@@ -1058,12 +1134,11 @@ IMPORTANT:
         recipe: recipeObj,
         isTransformative: false,
         modificationSummary: recipeObj.modification_summary || `Modified ${dishName} based on your request`,
+        newImageUrl: newImageUrl, // Include the new image URL if generated
         updatedDish: {
-          title: recipeObj.title || dishName, // Use AI-provided title if available, otherwise keep original
+          title: recipeObj.title || dishName, // Keep original title for minor changes unless changed
           description: recipeObj.description,
-          summary: recipeObj.modification_summary || `Modified ${dishName} based on your request`,
-          image: '', // No image - will be generated when user loads dish
-          recipe: recipeObj
+          summary: recipeObj.modification_summary || `Modified ${dishName} based on your request`
         }
       });
       
@@ -1079,7 +1154,7 @@ IMPORTANT:
   }
 });
 
-// 5. Optimized image generation endpoint with ModelsLab as primary and DALL-E as fallback
+// 5. Optimized image generation endpoint with DALL-E as primary and ModelLab as fallback
 app.post('/generate-image', async (req, res) => {
   const { dish } = req.body;
   const totalStartTime = Date.now();
@@ -1092,79 +1167,112 @@ app.post('/generate-image', async (req, res) => {
     console.log('=== IMAGE GENERATION TIMING START ===');
     console.log('Request received for dish:', dish);
     
-    console.log('Making ModelsLab API call as primary model...');
-    console.log('Using ModelsLab API for image generation');
+    console.log('Making DALL-E API call as primary model...');
+    console.log('Using DALL-E API for image generation');
     
     const apiStartTime = Date.now();
     
-    // Use ModelsLab as primary model
+    // Use DALL-E as primary model
     try {
-      console.log('Attempting ModelsLab primary generation...');
-      console.log('ModelsLab using dish:', dish);
+      console.log('Attempting DALL-E primary generation...');
+      console.log('DALL-E using dish:', dish);
+      
+      const dalleResponse = await openai.images.generate({
+        model: "dall-e-3",
+        prompt: prompt,
+        n: 1,
+        size: "1024x1024",
+      });
+      
+      const apiCallTime = Date.now() - apiStartTime;
+      console.log(`DALL-E API call took: ${apiCallTime}ms`);
+      
+      if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
+        const imageUrl = dalleResponse.data[0].url;
+        const totalTime = Date.now() - totalStartTime;
+        console.log(`DALL-E success: ${totalTime}ms | Image: ${imageUrl.substring(0, 50)}...`);
+        console.log('DALL-E: Sending response to frontend...');
+        const responseData = { imageUrl };
+        console.log('DALL-E: Response object:', responseData);
+        res.json(responseData);
+        console.log('DALL-E: Response sent successfully');
+        return;
+      } else {
+        throw new Error('Invalid DALL-E response structure');
+      }
+    } catch (dalleErr) {
+      console.error('DALL-E primary generation failed:', dalleErr.message);
+      console.error('DALL-E error stack:', dalleErr.stack);
+      throw dalleErr; // Re-throw to trigger ModelLab fallback
+    }
+    
+  } catch (err) {
+    console.error('DALL-E image generation failed:', err.message);
+    console.error('Error stack:', err.stack);
+    
+    // Check if it's a timeout error
+    if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
+      console.log('DALL-E request timed out, attempting ModelLab fallback...');
+    } else {
+      console.log('DALL-E request failed with error, attempting ModelLab fallback...');
+    }
+    
+    // Try ModelLab fallback
+    let modelLabErr = null;
+    try {
+      console.log('Attempting ModelLab fallback...');
+      console.log('ModelLab fallback using dish:', dish);
       
       const requestBody = {
         prompt: prompt,
-        model_id: "boziorealvisxlv4",
-        lora_model: "hasui-kawase-style-sd-xl",
-        lora_strength: 1.2,
-        width: "1024",
-        height: "1024",
-        seed: Math.floor(Math.random() * 1000000),
-        negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), (morbid), (mutilated), (out of frame), (extra limbs), (bad anatomy), (disfigured), (deformed), (cross-eye), (glitch), (oversaturated), (overexposed), (underexposed), (bad proportions), (bad hands), (bad feet), (cloned face), (long neck), (missing arms), (missing legs), (extra fingers), (fused fingers), (poorly drawn hands), (poorly drawn face), (mutation), (deformed eyes), watermark, text, logo, signature, grainy, tiling, censored, nsfw, ugly, blurry eyes, noisy image, bad lighting, unnatural skin, asymmetry",
-        num_inference_steps: "35",
+        model_id: "albedobase-xl-v0-2",
+        lora_model: null,
+        width: "512",
+        height: "512",
+        negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+        num_inference_steps: "20",
         scheduler: "DPMSolverMultistepScheduler",
-        guidance_scale: "8.0",
-        enhance_prompt: false,
-        key: MODELLAB_API_TOKEN
+        guidance_scale: "7.5",
+        enhance_prompt: null
       };
       
-      const modelsLabResponse = await axios.post(MODELLAB_API_URL, requestBody, {
+      const response = await axios.post(MODELLAB_API_URL, requestBody, {
         headers: {
+          'key': MODELLAB_API_TOKEN,
           'Content-Type': 'application/json'
         },
-        // No timeout for initial request - let ModelsLab take as long as needed
+        // No timeout for initial request - let ModelLab take as long as needed
         maxRedirects: 0,
         validateStatus: (status) => status < 500
       });
       
-      const apiCallTime = Date.now() - apiStartTime;
-      console.log(`ModelsLab API call took: ${apiCallTime}ms`);
-      console.log('ModelsLab API response status:', modelsLabResponse.status);
-      console.log('ModelsLab API response data:', JSON.stringify(modelsLabResponse.data, null, 2));
+      console.log('ModelLab API response status:', response.status);
+      console.log('ModelLab API response data:', JSON.stringify(response.data, null, 2));
       
-      // Check if we have a ready image URL in multiple possible locations
-      let imageUrl = null;
+      const apiCallTime = Date.now() - Date.now();
+      console.log(`ModelLab API call took: ${apiCallTime}ms`);
       
-      // Check primary output location
-      if (modelsLabResponse.data.output?.[0]) {
-        imageUrl = modelsLabResponse.data.output[0];
-      }
-      // Check meta.output location (where ModelsLab often puts the ready image)
-      else if (modelsLabResponse.data.meta?.output?.[0]) {
-        imageUrl = modelsLabResponse.data.meta.output[0];
-      }
-      // Check future_links location (alternative location)
-      else if (modelsLabResponse.data.future_links?.[0]) {
-        imageUrl = modelsLabResponse.data.future_links[0];
-      }
-      
-      if (imageUrl) {
+      // Check if we have a ready image URL regardless of status
+      if (response.data.output?.[0]) {
+        const imageUrl = response.data.output[0];
         const totalTime = Date.now() - totalStartTime;
-        console.log(`ModelsLab success: ${totalTime}ms | Image: ${imageUrl.substring(0, 50)}...`);
-        console.log('ModelsLab: Sending response to frontend...');
+        console.log(`ModelLab fallback success: ${totalTime}ms | Image: ${imageUrl.substring(0, 50)}...`);
+        console.log('ModelLab: Sending response to frontend...');
         const responseData = { imageUrl };
-        console.log('ModelsLab: Response object:', responseData);
+        console.log('ModelLab: Response object:', responseData);
         res.json(responseData);
-        console.log('ModelsLab: Response sent successfully');
+        console.log('ModelLab: Response sent successfully');
         return;
-      } else if (modelsLabResponse.data.status === 'processing') {
+      } else if (response.data.status === 'processing') {
+        // Always poll for completion - don't use meta.output or future_links as they may not be ready
+        console.log('ModelLab: Image is processing, starting polling...');
+        
         // Handle processing status with polling
-        console.log('ModelsLab: Image is processing, starting polling...');
-        console.log('ModelsLab processing, eta:', modelsLabResponse.data.eta);
+        console.log('ModelLab processing, eta:', response.data.eta);
         
         // Get the task ID and fetch URL for polling
-        const taskId = modelsLabResponse.data.id;
-        const fetchUrl = modelsLabResponse.data.fetch_result;
+        const taskId = response.data.id;
+        const fetchUrl = response.data.fetch_result;
         
         if (!taskId || !fetchUrl) {
           throw new Error('No task ID or fetch URL received for polling');
@@ -1176,7 +1284,7 @@ app.post('/generate-image', async (req, res) => {
         // Poll for completion with optimized performance
         let attempts = 0;
         const maxAttempts = 120; // 30 seconds max (120 * 0.25s)
-        const eta = modelsLabResponse.data.eta || 0.25; // Use ETA from response or default to 0.25s
+        const eta = response.data.eta || 0.25; // Use ETA from response or default to 0.25s
         
         while (attempts < maxAttempts) {
           // Use ETA-based polling: start fast, then slow down
@@ -1197,13 +1305,12 @@ app.post('/generate-image', async (req, res) => {
             
             if (pollResponse.data.status === 'success' && pollResponse.data.output && pollResponse.data.output.length > 0) {
               const imageUrl = pollResponse.data.output[0];
-              const totalTime = Date.now() - totalStartTime;
-              console.log(`ModelsLab polling success: ${totalTime}ms | Image: ${imageUrl.substring(0, 50)}...`);
+              console.log('Image URL extracted from polling:', imageUrl);
               return res.json({ imageUrl: imageUrl });
             } else if (pollResponse.data.status === 'failed') {
-              throw new Error(`ModelsLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
+              throw new Error(`ModelLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
             } else if (pollResponse.data.status === 'error') {
-              throw new Error(`ModelsLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
+              throw new Error(`ModelLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
             }
             // If still processing, continue polling
             
@@ -1217,69 +1324,23 @@ app.post('/generate-image', async (req, res) => {
           attempts++;
         }
         
-        throw new Error('ModelsLab image generation timed out after 30 seconds');
+        throw new Error('Image generation timed out after 30 seconds');
       } else {
-        throw new Error(`ModelsLab error: ${modelsLabResponse.data.status || 'Unknown status'}`);
-      }
-    } catch (modelsLabErr) {
-      console.error('ModelsLab primary generation failed:', modelsLabErr.message);
-      console.error('ModelsLab error stack:', modelsLabErr.stack);
-      throw modelsLabErr; // Re-throw to trigger DALL-E fallback
-    }
-    
-  } catch (err) {
-    console.error('ModelsLab image generation failed:', err.message);
-    console.error('Error stack:', err.stack);
-    
-    // Check if it's a timeout error
-    if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
-      console.log('ModelsLab request timed out, attempting DALL-E fallback...');
-    } else {
-      console.log('ModelsLab request failed with error, attempting DALL-E fallback...');
-    }
-    
-    // Try DALL-E fallback
-    let dalleErr = null;
-    try {
-      console.log('Attempting DALL-E fallback...');
-      console.log('DALL-E fallback using dish:', dish);
-      
-      const dalleResponse = await openai.images.generate({
-        model: "dall-e-3",
-        prompt: prompt,
-        n: 1,
-        size: "1024x1024",
-      });
-      
-      const apiCallTime = Date.now() - apiStartTime;
-      console.log(`DALL-E API call took: ${apiCallTime}ms`);
-      
-      if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
-        const imageUrl = dalleResponse.data[0].url;
-        const totalTime = Date.now() - totalStartTime;
-        console.log(`DALL-E fallback success: ${totalTime}ms | Image: ${imageUrl.substring(0, 50)}...`);
-        console.log('DALL-E: Sending response to frontend...');
-        const responseData = { imageUrl };
-        console.log('DALL-E: Response object:', responseData);
-        res.json(responseData);
-        console.log('DALL-E: Response sent successfully');
-        return;
-      } else {
-        throw new Error('Invalid DALL-E response structure');
+        throw new Error(`ModelLab error: ${response.data.status}`);
       }
     } catch (error) {
-      dalleErr = error;
-      console.error('DALL-E fallback also failed:', dalleErr.message);
-      console.error('DALL-E error stack:', dalleErr.stack);
+      modelLabErr = error;
+      console.error('ModelLab fallback also failed:', modelLabErr.message);
+      console.error('ModelLab error stack:', modelLabErr.stack);
     }
     
     // If both fail, return error but don't crash the app
-    console.error('Both ModelsLab and DALL-E failed, returning error response');
+    console.error('Both DALL-E and ModelLab failed, returning error response');
     res.status(500).json({ 
       error: 'Image generation failed', 
-      details: 'Both ModelsLab and DALL-E fallback failed',
-      modelsLabError: err.message,
-      dalleError: dalleErr?.message || 'Unknown DALL-E error'
+      details: 'Both DALL-E and ModelLab fallback failed',
+      dalleError: err.message,
+      modelLabError: modelLabErr?.message || 'Unknown ModelLab error'
     });
   }
 });
@@ -1391,19 +1452,121 @@ IMPORTANT:
       });
     }
 
-    // Skip image generation during remix - let frontend handle it on dish load
-    console.log('Skipping image generation during remix - will generate when user loads dish');
+    // Generate new image for the remixed dish
+    let newImageUrl = null;
+    try {
+      console.log('Generating new image for remixed dish:', recipeObj.title);
+      
+      const imagePrompt = `A beautiful hand-drawn illustration of ${recipeObj.title}, Japanese retro style, flat colors, grainy texture, minimalist design, no text, no watermark, not a photo`;
+      
+      // Try DALL-E first
+      try {
+        console.log('Attempting DALL-E for remix image...');
+        const dalleResponse = await openai.images.generate({
+          model: "dall-e-3",
+          prompt: imagePrompt,
+          n: 1,
+          size: "1024x1024",
+        });
+        
+        if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
+          newImageUrl = dalleResponse.data[0].url;
+          console.log('DALL-E remix image generated:', newImageUrl.substring(0, 50) + '...');
+        } else {
+          throw new Error('Invalid DALL-E response structure');
+        }
+      } catch (dalleErr) {
+        console.log('DALL-E failed for remix, trying ModelLab fallback...');
+        
+        // ModelLab fallback
+        const imageResponse = await axios.post(MODELLAB_API_URL, {
+          prompt: imagePrompt,
+          model_id: "albedobase-xl-v0-2",
+          lora_model: null,
+          width: "512",
+          height: "512",
+          negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+          num_inference_steps: "20",
+          scheduler: "DPMSolverMultistepScheduler",
+          guidance_scale: "7.5",
+          enhance_prompt: null
+        }, {
+          headers: {
+            'key': MODELLAB_API_TOKEN,
+            'Content-Type': 'application/json'
+          },
+          // No timeout for initial request - let ModelLab take as long as needed
+          maxRedirects: 0,
+          validateStatus: (status) => status < 500
+        });
+      
+        // Check if we have a ready image URL regardless of status
+        if (imageResponse.data.output?.[0]) {
+          newImageUrl = imageResponse.data.output[0];
+          console.log('ModelLab remix image generated:', newImageUrl.substring(0, 50) + '...');
+        } else if (imageResponse.data.status === 'processing') {
+          // Handle polling for processing status
+          const taskId = imageResponse.data.id;
+          const fetchUrl = imageResponse.data.fetch_result;
+          
+          if (!taskId || !fetchUrl) {
+            throw new Error('No task ID or fetch URL received for polling');
+          }
+          
+          let attempts = 0;
+          const maxAttempts = 120; // 30 seconds max (120 * 0.25s)
+          const eta = imageResponse.data.eta || 0.25;
+          
+          while (attempts < maxAttempts) {
+            const delay = Math.min(250, Math.max(100, eta * 1000)); // 100ms to 250ms based on ETA
+            await new Promise(resolve => setTimeout(resolve, delay));
+            
+            try {
+              const pollResponse = await axios.post(fetchUrl, {}, {
+                headers: { 'key': MODELLAB_API_TOKEN },
+                timeout: 2000, // Reduced from 3s to 2s
+                maxRedirects: 0
+              });
+              
+              if (pollResponse.data.status === 'success' && pollResponse.data.output?.[0]) {
+                newImageUrl = pollResponse.data.output[0];
+                console.log('ModelLab remix image generated (polled):', newImageUrl.substring(0, 50) + '...');
+                break;
+              } else if (pollResponse.data.status === 'failed') {
+                throw new Error(`ModelLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
+              } else if (pollResponse.data.status === 'error') {
+                throw new Error(`ModelLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
+              }
+            } catch (pollErr) {
+              console.error('Polling error:', pollErr.message);
+              if (attempts === maxAttempts - 1) {
+                throw pollErr;
+              }
+            }
+            attempts++;
+          }
+          
+          if (!newImageUrl) {
+            throw new Error('Image generation timed out after 30 seconds');
+          }
+        } else {
+          throw new Error(`ModelLab error: ${imageResponse.data.status}`);
+        }
+      }
+    } catch (imageErr) {
+      console.error('Failed to generate new image for remix:', imageErr.message);
+      // Continue without new image - use original or placeholder
+    }
 
     res.json({ 
       remixSummary, 
       recipe: recipeObj,
       originalDish: currentDish.title,
+      newImageUrl: newImageUrl, // Include the new image URL if generated
       updatedDish: {
         title: recipeObj.title,
         description: recipeObj.description,
-        summary: remixSummary,
-        image: '', // No image - will be generated when user loads dish
-        recipe: recipeObj
+        summary: remixSummary
       }
     });
   } catch (err) {
@@ -1457,18 +1620,120 @@ IMPORTANT: The RECIPE must be valid JSON. Nutrition values must be numbers only,
       return res.status(500).json({ error: 'No recipe JSON found', raw: text });
     }
     
-    // Skip image generation during fusion - let frontend handle it on dish load
-    console.log('Skipping image generation during fusion - will generate when user loads dish');
+    // Generate new image for the fused dish
+    let newImageUrl = null;
+    try {
+      console.log('Generating new image for fused dish:', recipeObj.title);
+      
+      const imagePrompt = `A beautiful hand-drawn illustration of ${recipeObj.title}, Japanese retro style, flat colors, grainy texture, minimalist design, no text, no watermark, not a photo`;
+      
+      // Try DALL-E first
+      try {
+        console.log('Attempting DALL-E for fusion image...');
+        const dalleResponse = await openai.images.generate({
+          model: "dall-e-3",
+          prompt: imagePrompt,
+          n: 1,
+          size: "1024x1024",
+        });
+        
+        if (dalleResponse.data && dalleResponse.data[0] && dalleResponse.data[0].url) {
+          newImageUrl = dalleResponse.data[0].url;
+          console.log('DALL-E fusion image generated:', newImageUrl.substring(0, 50) + '...');
+        } else {
+          throw new Error('Invalid DALL-E response structure');
+        }
+      } catch (dalleErr) {
+        console.log('DALL-E failed for fusion, trying ModelLab fallback...');
+        
+        // ModelLab fallback
+        const imageResponse = await axios.post(MODELLAB_API_URL, {
+          prompt: imagePrompt,
+          model_id: "albedobase-xl-v0-2",
+          lora_model: null,
+          width: "512",
+          height: "512",
+          negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+          num_inference_steps: "20",
+          scheduler: "DPMSolverMultistepScheduler",
+          guidance_scale: "7.5",
+          enhance_prompt: null
+        }, {
+          headers: {
+            'key': MODELLAB_API_TOKEN,
+            'Content-Type': 'application/json'
+          },
+          // No timeout for initial request - let ModelLab take as long as needed
+          maxRedirects: 0,
+          validateStatus: (status) => status < 500
+        });
+      
+        // Check if we have a ready image URL regardless of status
+        if (imageResponse.data.output?.[0]) {
+          newImageUrl = imageResponse.data.output[0];
+          console.log('ModelLab fusion image generated:', newImageUrl.substring(0, 50) + '...');
+        } else if (imageResponse.data.status === 'processing') {
+          // Handle polling for processing status
+          const taskId = imageResponse.data.id;
+          const fetchUrl = imageResponse.data.fetch_result;
+          
+          if (!taskId || !fetchUrl) {
+            throw new Error('No task ID or fetch URL received for polling');
+          }
+          
+          let attempts = 0;
+          const maxAttempts = 120; // 30 seconds max (120 * 0.25s)
+          const eta = imageResponse.data.eta || 0.25;
+          
+          while (attempts < maxAttempts) {
+            const delay = Math.min(250, Math.max(100, eta * 1000)); // 100ms to 250ms based on ETA
+            await new Promise(resolve => setTimeout(resolve, delay));
+            
+            try {
+              const pollResponse = await axios.post(fetchUrl, {}, {
+                headers: { 'key': MODELLAB_API_TOKEN },
+                timeout: 2000, // Reduced from 3s to 2s
+                maxRedirects: 0
+              });
+              
+              if (pollResponse.data.status === 'success' && pollResponse.data.output?.[0]) {
+                newImageUrl = pollResponse.data.output[0];
+                console.log('ModelLab fusion image generated (polled):', newImageUrl.substring(0, 50) + '...');
+                break;
+              } else if (pollResponse.data.status === 'failed') {
+                throw new Error(`ModelLab task failed: ${pollResponse.data.message || 'Unknown error'}`);
+              } else if (pollResponse.data.status === 'error') {
+                throw new Error(`ModelLab task error: ${pollResponse.data.message || JSON.stringify(pollResponse.data)}`);
+              }
+            } catch (pollErr) {
+              console.error('Polling error:', pollErr.message);
+              if (attempts === maxAttempts - 1) {
+                throw pollErr;
+              }
+            }
+            attempts++;
+          }
+          
+          if (!newImageUrl) {
+            throw new Error('Image generation timed out after 30 seconds');
+          }
+        } else {
+          throw new Error(`ModelLab error: ${imageResponse.data.status}`);
+        }
+      }
+    } catch (imageErr) {
+      console.error('Failed to generate new image for fusion:', imageErr.message);
+      // Continue without new image - use original or placeholder
+    }
     
     res.json({ 
       summary, 
       recipe: recipeObj,
+      newImageUrl: newImageUrl, // Include the new image URL if generated
       updatedDish: {
         title: recipeObj.title,
         description: recipeObj.description,
-        summary: summary,
-        image: '', // No image - will be generated when user loads dish
-        recipe: recipeObj
+        summary: summary
       }
     });
   } catch (err) {
