@@ -934,21 +934,21 @@ IMPORTANT:
           // Try ModelsLab first
           try {
             console.log('Attempting ModelsLab for modification image...');
-            const modelsLabResponse = await axios.post(MODELLAB_API_URL, {
+            
+            const requestBody = {
               prompt: imagePrompt,
               model_id: "boziorealvisxlv4",
               lora_model: "hasui-kawase-style-sd-xl",
-              lora_strength: 1.2,
               width: "1024",
               height: "1024",
-              seed: Math.floor(Math.random() * 1000000),
-              negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), (morbid), (mutilated), (out of frame), (extra limbs), (bad anatomy), (disfigured), (deformed), (cross-eye), (glitch), (oversaturated), (overexposed), (underexposed), (bad proportions), (bad hands), (bad feet), (cloned face), (long neck), (missing arms), (missing legs), (extra fingers), (fused fingers), (poorly drawn hands), (poorly drawn face), (mutation), (deformed eyes), watermark, text, logo, signature, grainy, tiling, censored, nsfw, ugly, blurry eyes, noisy image, bad lighting, unnatural skin, asymmetry",
-              num_inference_steps: "35",
+              negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+              num_inference_steps: "31",
               scheduler: "DPMSolverMultistepScheduler",
-              guidance_scale: "8.0",
-              enhance_prompt: false,
-              key: MODELLAB_API_TOKEN
-            }, {
+              guidance_scale: "7.5",
+              enhance_prompt: null
+            };
+            
+            const modelsLabResponse = await axios.post(MODELLAB_API_URL, requestBody, {
               headers: {
                 'key': MODELLAB_API_TOKEN,
                 'Content-Type': 'application/json'
@@ -1106,20 +1106,18 @@ app.post('/generate-image', async (req, res) => {
         prompt: prompt,
         model_id: "boziorealvisxlv4",
         lora_model: "hasui-kawase-style-sd-xl",
-        lora_strength: 1.2,
         width: "1024",
         height: "1024",
-        seed: Math.floor(Math.random() * 1000000),
-        negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), (morbid), (mutilated), (out of frame), (extra limbs), (bad anatomy), (disfigured), (deformed), (cross-eye), (glitch), (oversaturated), (overexposed), (underexposed), (bad proportions), (bad hands), (bad feet), (cloned face), (long neck), (missing arms), (missing legs), (extra fingers), (fused fingers), (poorly drawn hands), (poorly drawn face), (mutation), (deformed eyes), watermark, text, logo, signature, grainy, tiling, censored, nsfw, ugly, blurry eyes, noisy image, bad lighting, unnatural skin, asymmetry",
-        num_inference_steps: "35",
+        negative_prompt: "(worst quality:2), (low quality:2), (normal quality:2), (jpeg artifacts), (blurry), (duplicate), text, writing, watermark, signature, photo, realistic, 3d, cgi, computer generated",
+        num_inference_steps: "31",
         scheduler: "DPMSolverMultistepScheduler",
-        guidance_scale: "8.0",
-        enhance_prompt: false,
-        key: MODELLAB_API_TOKEN
+        guidance_scale: "7.5",
+        enhance_prompt: null
       };
       
       const modelsLabResponse = await axios.post(MODELLAB_API_URL, requestBody, {
         headers: {
+          'key': MODELLAB_API_TOKEN,
           'Content-Type': 'application/json'
         },
         // No timeout for initial request - let ModelsLab take as long as needed
